@@ -5,4 +5,4 @@ The file above is the complete GPT-2 code with training code (based on nanoGPT b
 
 I made this repo because all of the other repos with this code have it bigger and in many files. I'd like to see visually how the code flows, so it's already difficult just having it in text instead, and that's why it at least must be in 1 file only, and very small code all without making anything confusing either.
 
-NOTE: GPT-3 apparently did not use Dropout becauese the dataset was massive. This code has left out Dropout. Still looks like it will match GPT-2 score by the photo. My checkpoint is attached, we can see if it generates good and even continue training. But to load it, it needs code - ask the AI if interested in doing that.
+NOTE: GPT-3 apparently did not use Dropout becauese the dataset was massive. This code has left out Dropout. Still looks like it will match GPT-2 score by the photo. My checkpoint is attached (under Releases, look closely), we can see if it generates good and even continue training. But to load it, it needs code - ask the AI if interested in doing that.
