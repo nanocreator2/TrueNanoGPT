@@ -1,0 +1,233 @@
+import math, time, tiktoken, gc, os
+import numpy as cnp, cupy as np
+from datasets import load_dataset
+
+SEED = 1337
+target_bs = 512
+bs = 16
+accum_steps = target_bs // bs
+T = 1024
+n_embd = 768
+n_layer = 12
+n_head = 12
+max_steps = 600000
+max_lr = 6e-4
+min_lr = 6e-5
+warmup_steps = 2000
+cnp.random.seed(SEED); np.random.seed(SEED)
+enc = tiktoken.get_encoding("gpt2")
+
+val_ds_stream = load_dataset("Skylion007/openwebtext", split="train", streaming=True)
+val_iter = iter(val_ds_stream)
+val_ids = []
+while len(val_ids) < 200000:
+    try:
+        txt = next(val_iter)["text"].strip()
+        if len(txt) > 0: val_ids.extend(enc.encode(txt))
+    except StopIteration: break
+val_data = cnp.array(val_ids, dtype=cnp.uint16)
+
+def get_batch_stream(bs, T, buffer_limit=100000):
+    ds_stream = load_dataset("Skylion007/openwebtext", split="train", streaming=True)
+    ds_stream = ds_stream.skip(100000).shuffle(buffer_size=10000, seed=SEED)    
+    dataset_iter = iter(ds_stream)
+    buffer = []
+
+    while True:
+        while len(buffer) < buffer_limit:
+            try:
+                txt = next(dataset_iter)["text"].strip()
+                if len(txt) > 0: buffer.extend(enc.encode(txt))
+            except StopIteration:
+                print("End of dataset! Resetting stream...", flush=True)
+                ds_stream = load_dataset("Skylion007/openwebtext", split="train", streaming=True)
+                ds_stream = ds_stream.skip(100000).shuffle(buffer_size=10000, seed=SEED)
+                dataset_iter = iter(ds_stream)
+
+        shard = cnp.array(buffer, dtype=cnp.uint16)
+        buffer = []
+        steps_in_shard = len(shard) // (bs * T)
+        if steps_in_shard > 0:
+            for _ in range(steps_in_shard):
+                ix = cnp.random.randint(0, len(shard) - T - 1, (bs,))
+                xb = np.array(cnp.stack([shard[i:i + T] for i in ix]))
+                yb = np.array(cnp.stack([shard[i + 1:i + T + 1] for i in ix]))
+                yield xb, yb
+        del shard
+
+train_loader = get_batch_stream(bs, T)
+
+vs, hs = 50257, n_embd // n_head
+params, layers = {}, []
+
+def P(s, d=0.02): return {'val': np.array(cnp.random.normal(0, d, s).astype(cnp.float32))}
+def Z(d): return {'val': np.zeros(d, dtype=np.float32)}
+def O(d): return {'val': np.ones(d, dtype=np.float32)}
+
+params['tok_emb'], params['pos_emb'] = P((vs, n_embd)), P((T, n_embd))
+scale = 1.0 / math.sqrt(2.0 * n_layer)
+
+for _ in range(n_layer):
+    l = {f'{n}_w': P((n_embd, n_embd)) for n in 'qkv'}
+    l.update({f'{n}_b': Z(n_embd) for n in ['q', 'k', 'v', 'p', 'ml2']})
+    l.update({f'{n}_{x}': f(n_embd) for n in ('ln1', 'ln2') for x, f in [('g', O), ('b', Z)]})
+    l.update({'p_w': P((n_embd, n_embd), 0.02 * scale), 'ml1_w': P((n_embd, 4*n_embd)), 'ml1_b': Z(4*n_embd), 'ml2_w': P((4*n_embd, n_embd), 0.02 * scale)})
+    layers.append(l)
+
+params['ln_f_g'], params['ln_f_b'] = O(n_embd), Z(n_embd)
+mask_buf = np.tril(np.ones((1, 1, T, T), dtype=np.float32))
+
+def blk_fwd(h, p, mask, c=None):
+    mu, var = h.mean(-1, keepdims=1), h.var(-1, keepdims=1)
+    ln1 = (h - mu) / np.sqrt(var + 1e-5); hm = ln1 * p['ln1_g']['val'] + p['ln1_b']['val']
+    q, k, v = [hm @ p[x]['val'] + p[y]['val'] for x, y in [('q_w', 'q_b'), ('k_w', 'k_b'), ('v_w', 'v_b')]]
+    qh, kh, vh = [x.reshape(h.shape[0], h.shape[1], n_head, hs).transpose(0, 2, 1, 3) for x in [q, k, v]]
+    att = (qh @ kh.swapaxes(-1, -2)) * (hs ** -0.5) + (mask - 1) * 1e9
+    att_w = np.exp(att - att.max(-1, keepdims=1)); att_w /= att_w.sum(-1, keepdims=1)
+    h = h + (att_w @ vh).transpose(0, 2, 1, 3).reshape(h.shape[0], h.shape[1], n_embd) @ p['p_w']['val'] + p['p_b']['val']
+    mu2, var2 = h.mean(-1, keepdims=1), h.var(-1, keepdims=1)
+    ln2 = (h - mu2) / np.sqrt(var2 + 1e-5); hm2 = ln2 * p['ln2_g']['val'] + p['ln2_b']['val']
+    hb = hm2 @ p['ml1_w']['val'] + p['ml1_b']['val']
+    th = np.tanh(np.sqrt(2 / np.pi) * (hb + 0.044715 * hb ** 3)); gelu = 0.5 * hb * (1 + th)
+    h = h + gelu @ p['ml2_w']['val'] + p['ml2_b']['val']
+    if c is not None: c.update({'ln1_hat': ln1, 'ln1_var': var, 'ln1_out': hm, 'q': q, 'k': k, 'v': v, 'att_weights': att_w, 'ln2_hat': ln2, 'ln2_var': var2, 'ln2_out': hm2, 'gelu_out': gelu, 'gelu_tanh': th, 'ml1_pre': hb})
+    return h
+
+def G_lin(dy, x, w, b):
+    dw = x.reshape(-1, w['val'].shape[0]).T @ dy.reshape(-1, w['val'].shape[1])
+    db = dy.sum((0, 1))
+    if 'grad' not in w: w['grad'] = np.zeros_like(w['val'])
+    if 'grad' not in b: b['grad'] = np.zeros_like(b['val'])
+    w['grad'] += dw
+    b['grad'] += db
+    return dy @ w['val'].T
+
+def G_ln(dy, x, v, g, b):
+    dg = (dy * x).sum((0, 1))
+    db = dy.sum((0, 1))
+    if 'grad' not in g: g['grad'] = np.zeros_like(g['val'])
+    if 'grad' not in b: b['grad'] = np.zeros_like(b['val'])
+    g['grad'] += dg
+    b['grad'] += db
+    dx = dy * g['val']
+    return (dx - dx.mean(-1, keepdims=1) - x * (dx * x).mean(-1, keepdims=1)) / np.sqrt(v + 1e-5)
+
+def fwd(x, c=None):
+    h = params['tok_emb']['val'][x] + params['pos_emb']['val'][np.arange(x.shape[1])]
+    for i, l in enumerate(layers): h = blk_fwd(h, l, mask_buf[:, :, :x.shape[1], :x.shape[1]], c[i] if c else None)
+    mu, var = h.mean(-1, keepdims=1), h.var(-1, keepdims=1)
+    h_f = ((h - mu) / np.sqrt(var + 1e-5)) * params['ln_f_g']['val'] + params['ln_f_b']['val']
+    return h, mu, var, h_f, h_f @ params['tok_emb']['val'].T
+
+def estimate_loss(eval_data, eval_steps=20):
+    losses = []
+    gc.collect(); np.get_default_memory_pool().free_all_blocks()
+    for _ in range(eval_steps):
+        ix = cnp.random.randint(0, len(eval_data) - T - 1, (bs,))
+        xb = np.array(cnp.stack([eval_data[i:i+T] for i in ix]))
+        yb = np.array(cnp.stack([eval_data[i+1:i+T+1] for i in ix]))
+        _, _, _, _, logits = fwd(xb)
+        log_flat, y_flat = logits.reshape(-1, vs), yb.reshape(-1)
+        probs = np.exp(log_flat - log_flat.max(1, keepdims=1)); probs /= probs.sum(1, keepdims=1)
+        losses.append(-np.log(probs[np.arange(len(y_flat)), y_flat]).mean().item())
+        del logits, probs, xb, yb 
+    return sum(losses) / len(losses)
+
+def get_lr(it):
+    if it < warmup_steps: return max_lr * (it + 1) / warmup_steps
+    if it > max_steps: return min_lr
+    decay_ratio = (it - warmup_steps) / (max_steps - warmup_steps)
+    return min_lr + 0.5 * (max_lr - min_lr) * (1.0 + math.cos(math.pi * decay_ratio))
+
+for step in range(max_steps):
+    t0 = time.time()
+    lr = get_lr(step)
+
+    # 1. Zero Grads
+    for p_list in [params, *layers]:
+        for p in p_list.values():
+            if 'val' in p: p['grad'] = np.zeros_like(p['val'])
+
+    current_loss_accum = 0
+
+    # 2. Accumulation Loop
+    for micro_step in range(accum_steps):
+        xb, yb = next(train_loader)
+        caches = [{} for _ in layers]
+        h, mu_f, var_f, h_f, logits = fwd(xb, caches)
+        log_flat, y_flat = logits.reshape(-1, vs), yb.reshape(-1)
+        
+        # Loss
+        probs = np.exp(log_flat - np.max(log_flat, 1, keepdims=1))
+        probs /= probs.sum(1, keepdims=1)
+        loss_val = -np.log(probs[np.arange(len(y_flat)), y_flat]).mean().item()
+        current_loss_accum += loss_val / accum_steps 
+
+        # Grads
+        probs[np.arange(len(y_flat)), y_flat] -= 1
+        probs /= len(y_flat)
+        dlog = probs / accum_steps 
+        del log_flat, probs
+
+        # Backward
+        dh_f = (dlog @ params['tok_emb']['val']).reshape(bs, T, n_embd)
+        
+        if 'grad' not in params['tok_emb']: params['tok_emb']['grad'] = np.zeros_like(params['tok_emb']['val'])
+        params['tok_emb']['grad'] += (h_f.reshape(-1, n_embd).T @ dlog).T
+        del dlog, logits
+
+        dh = G_ln(dh_f, (h - mu_f) / np.sqrt(var_f + 1e-5), var_f, params['ln_f_g'], params['ln_f_b']) 
+
+        for i in reversed(range(n_layer)):
+            l, c = layers[i], caches[i]
+            dh_r = dh
+            dgelu = G_lin(dh, c['gelu_out'], l['ml2_w'], l['ml2_b'])
+            d_in = dgelu * (0.5 * (1 + c['gelu_tanh']) + 0.5 * c['ml1_pre'] * (1 - c['gelu_tanh'] ** 2) * np.sqrt(2 / np.pi) * (1 + 0.134145 * c['ml1_pre'] ** 2))
+            dh = dh_r + G_ln(G_lin(d_in, c['ln2_out'], l['ml1_w'], l['ml1_b']), c['ln2_hat'], c['ln2_var'], l['ln2_g'], l['ln2_b'])
+            
+            dh_r, datt_p = dh, dh
+            datt_h = G_lin(dh, (c['att_weights'] @ c['v'].reshape(bs, T, n_head, hs).transpose(0, 2, 1, 3)).transpose(0, 2, 1, 3), l['p_w'], l['p_b'])
+            datt_h = datt_h.reshape(bs, T, n_head, hs).transpose(0, 2, 1, 3)
+            vh, kh, qh = [x.reshape(bs, T, n_head, hs).transpose(0, 2, 1, 3) for x in [c['v'], c['k'], c['q']]]
+            ds = c['att_weights'] * ((datt_h @ vh.transpose(0, 1, 3, 2)) - ((datt_h @ vh.transpose(0, 1, 3, 2)) * c['att_weights']).sum(-1, keepdims=1)) * (hs ** -0.5)
+            dhm = sum(G_lin(g.transpose(0, 2, 1, 3).reshape(bs, T, n_embd), c['ln1_out'], l[n+'_w'], l[n+'_b']) for n, g in [('q', ds @ kh), ('k', ds.transpose(0, 1, 3, 2) @ qh), ('v', c['att_weights'].transpose(0, 1, 3, 2) @ datt_h)])
+            dh = dh_r + G_ln(dhm, c['ln1_hat'], c['ln1_var'], l['ln1_g'], l['ln1_b'])
+
+        if 'grad' not in params['pos_emb']: params['pos_emb']['grad'] = np.zeros_like(params['pos_emb']['val'])
+        params['pos_emb']['grad'] += dh.sum(0)
+        np.add.at(params['tok_emb']['grad'], xb.ravel(), dh.reshape(-1, n_embd))
+
+    # 3. Optimization Step (AdamW)
+    n_ps = [('tok_emb', params['tok_emb']), ('pos_emb', params['pos_emb']), ('ln_f_g', params['ln_f_g']), ('ln_f_b', params['ln_f_b'])]
+    for l in layers: n_ps.extend(l.items())
+    gnorm = np.sqrt(sum(np.sum(np.square(p['grad'])) for n, p in n_ps if 'grad' in p))
+    clip = 1.0 if gnorm <= 1.0 else 1.0 / (gnorm + 1e-6)
+
+    for n, p in n_ps:
+        if 'grad' not in p: continue
+        if 'm' not in p: p['m'], p['v'] = np.zeros_like(p['val']), np.zeros_like(p['val'])        
+        g = p['grad'] * clip
+        p['m'] = 0.9 * p['m'] + 0.1 * g
+        p['v'] = 0.999 * p['v'] + 0.001 * (g ** 2)
+        m_hat = p['m'] / (1 - 0.9 ** (step + 1))
+        v_hat = p['v'] / (1 - 0.999 ** (step + 1))        
+        
+        # AdamW Weight Decay
+        if n.endswith('_w') or 'emb' in n:
+            p['val'] *= (1.0 - lr * 0.1)
+
+        p['val'] -= lr * m_hat / (np.sqrt(v_hat) + 1e-8)
+    
+    if step % 2 == 0: 
+        np.get_default_memory_pool().free_all_blocks()    
+    if step % 100 == 0:
+        val_loss = estimate_loss(val_data, eval_steps=20)
+        print(f"step {step} | lr {lr} | train_loss {current_loss_accum} | val_loss {val_loss}", flush=True)
+
+    if step > 0 and step % 100 == 0: 
+        save_dict = {k: v['val'].get() for k, v in params.items() if 'val' in v}
+        for i, layer in enumerate(layers):
+            for k, v in layer.items():
+                if isinstance(v, dict) and 'val' in v:
+                    save_dict[f'l{i}_{k}'] = v['val'].get()
+        cnp.savez(f"/workspace/gpt2_checkpoint_step_{step}.npz", **save_dict)
