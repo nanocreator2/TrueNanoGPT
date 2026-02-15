@@ -1,0 +1,137 @@
+import tiktoken
+import numpy as np
+from datasets import load_dataset
+
+seed, target_batch, bs, seq_len = 1337, 16, 8, 16
+accum_steps = target_batch // bs
+n_embd, n_layer, n_head = 128, 4, 4
+vocab_size, head_size = 50257, n_embd // n_head
+max_steps, max_lr, min_lr, warmup_steps = 1000, 6e-4, 6e-5, 200
+np.random.seed(seed)
+enc = tiktoken.get_encoding("gpt2")
+
+val_ids = []
+for example in load_dataset("Skylion007/openwebtext", split="train", streaming=True):
+    if t := example["text"].strip(): val_ids.extend(enc.encode(t))
+    if len(val_ids) >= 200000: break
+val_data = np.array(val_ids, dtype=np.uint16)
+
+ds_iter = iter(load_dataset("Skylion007/openwebtext", split="train", streaming=True).skip(100000).shuffle(buffer_size=10000, seed=seed))
+buffer, shard, batches_left = [], None, 0
+
+init_param = lambda s, d=0.02: {'val': np.array(np.random.normal(0, d, s).astype(np.float32))}
+z = lambda d: {'val': np.zeros(d, dtype=np.float32)}
+
+global_weights, blocks = {}, []
+global_weights['tok_emb'], global_weights['pos_emb'] = init_param((vocab_size, n_embd)), init_param((seq_len, n_embd))
+scale = 1.0 / (2.0 * n_layer)**0.5
+for _ in range(n_layer):
+    b = {f'{n}_w': init_param((n_embd, n_embd)) for n in 'qkv'}
+    b.update({f'{n}_b': z(n_embd) for n in 'q k v p ml2 ln1 ln2'.split()})
+    b.update({f'{n}_g': {'val': np.ones(n_embd, dtype=np.float32)} for n in ['ln1','ln2']})
+    b.update({'p_w': init_param((n_embd, n_embd), 0.02*scale), 'ml1_w': init_param((n_embd, 4*n_embd)), 'ml1_b': z(4*n_embd), 'ml2_w': init_param((4*n_embd, n_embd), 0.02*scale)})
+    blocks.append(b)
+global_weights['ln_f_g'], global_weights['ln_f_b'], mask_buf = {'val': np.ones(n_embd, dtype=np.float32)}, z(n_embd), np.tril(np.ones((1, 1, seq_len, seq_len), dtype=np.float32))
+
+def grad_lin(d_out, inp, w, b):
+    w['grad'] += inp.reshape(-1, w['val'].shape[0]).T @ d_out.reshape(-1, w['val'].shape[1])
+    b['grad'] += d_out.sum((0, 1))
+    return d_out @ w['val'].T
+def grad_ln(d_out, x_norm, var, gamma, beta):
+    gamma['grad'] += (d_out * x_norm).sum((0, 1))
+    beta['grad'] += d_out.sum((0, 1))
+    dx = d_out * gamma['val']
+    return (dx - dx.mean(-1, keepdims=1) - x_norm * (dx * x_norm).mean(-1, keepdims=1)) / np.sqrt(var + 1e-5)
+
+def forward(inputs, targets=None):
+    hidden = global_weights['tok_emb']['val'][inputs] + global_weights['pos_emb']['val'][np.arange(inputs.shape[1])]
+    mask = mask_buf[:, :, :inputs.shape[1], :inputs.shape[1]]
+    backward_callbacks = []
+    for block in blocks:
+        ln1_var = hidden.var(-1, keepdims=1)
+        ln1_norm = (hidden - hidden.mean(-1, keepdims=1)) / np.sqrt(ln1_var + 1e-5)
+        ln1_out = ln1_norm * block['ln1_g']['val'] + block['ln1_b']['val']
+        q, k, v = [ln1_out @ block[f'{n}_w']['val'] + block[f'{n}_b']['val'] for n in 'qkv']
+        qh, kh, vh = [t.reshape(bs, -1, n_head, head_size).transpose(0, 2, 1, 3) for t in [q, k, v]]
+        att = (qh @ kh.swapaxes(-1, -2)) * (head_size**-0.5) + (mask - 1) * 1e9
+        att_w = np.exp(att - att.max(-1, keepdims=1))
+        att_w /= att_w.sum(-1, keepdims=1)
+        att_out = (att_w @ vh).transpose(0, 2, 1, 3).reshape(bs, -1, n_embd)
+        h_mid = hidden + att_out @ block['p_w']['val'] + block['p_b']['val']
+        ln2_var = h_mid.var(-1, keepdims=1)
+        ln2_norm = (h_mid - h_mid.mean(-1, keepdims=1)) / np.sqrt(ln2_var + 1e-5)
+        ln2_out = ln2_norm * block['ln2_g']['val'] + block['ln2_b']['val']
+        ml1 = ln2_out @ block['ml1_w']['val'] + block['ml1_b']['val']
+        tanh_out = np.tanh(np.sqrt(2/np.pi) * (ml1 + 0.044715 * ml1**3))
+        gelu_out = 0.5 * ml1 * (1 + tanh_out)
+        cache = (block, ln1_out, ln1_norm, ln1_var, qh, kh, vh, att_w, att_out, ln2_out, ln2_norm, ln2_var, ml1, tanh_out, gelu_out)
+        def backward(dout, c=cache):
+            b, l1, n1, v1, qh, kh, vh, aw, ao, l2, n2, v2, ml, to, go = c
+            dml2 = grad_lin(dout, go, b['ml2_w'], b['ml2_b'])
+            dgelu = dml2 * (0.5*(1+to) + 0.5*ml*(1-to**2)*np.sqrt(2/np.pi)*(1+0.134145*ml**2))
+            dh_mid = dout + grad_ln(grad_lin(dgelu, l2, b['ml1_w'], b['ml1_b']), n2, v2, b['ln2_g'], b['ln2_b'])
+            d_att_head = grad_lin(dh_mid, ao, b['p_w'], b['p_b']).reshape(bs, -1, n_head, head_size).transpose(0, 2, 1, 3)
+            d_att_logits = aw * ((d_att_head @ vh.swapaxes(-1, -2)) - (d_att_head @ vh.swapaxes(-1, -2) * aw).sum(-1, keepdims=1)) * (head_size**-0.5)
+            dq, dk, dv = [x.transpose(0, 2, 1, 3).reshape(bs, -1, n_embd) for x in [d_att_logits @ kh, d_att_logits.swapaxes(-1, -2) @ qh, aw.swapaxes(-1, -2) @ d_att_head]]
+            return dh_mid + grad_ln(sum(grad_lin(dx, l1, b[f'{n}_w'], b[f'{n}_b']) for n, dx in zip('qkv', [dq, dk, dv])), n1, v1, b['ln1_g'], b['ln1_b'])
+        backward_callbacks.append(backward)
+        hidden = h_mid + gelu_out @ block['ml2_w']['val'] + block['ml2_b']['val']
+    final_var = hidden.var(-1, keepdims=1)
+    final_norm = (hidden - hidden.mean(-1, keepdims=1)) / np.sqrt(final_var + 1e-5)
+    h_final = final_norm * global_weights['ln_f_g']['val'] + global_weights['ln_f_b']['val']
+    logits = h_final @ global_weights['tok_emb']['val'].T
+    if targets is None: return logits
+    logits_flat, y_flat = logits.reshape(-1, vocab_size), targets.reshape(-1)
+    probs = np.exp(logits_flat - np.max(logits_flat, 1, keepdims=1))
+    probs /= probs.sum(1, keepdims=1)
+    probs[np.arange(len(y_flat)), y_flat] -= 1
+    grad_logits = (probs / len(y_flat)) / accum_steps
+    global_weights['tok_emb']['grad'] += (h_final.reshape(-1, n_embd).T @ grad_logits.reshape(-1, vocab_size)).T        
+    d_hidden = grad_ln(grad_logits.reshape(bs, -1, vocab_size) @ global_weights['tok_emb']['val'], final_norm, final_var, global_weights['ln_f_g'], global_weights['ln_f_b'])        
+    for back_fn in reversed(backward_callbacks):
+        d_hidden = back_fn(d_hidden)
+    global_weights['pos_emb']['grad'] += d_hidden.sum(0)
+    np.add.at(global_weights['tok_emb']['grad'], inputs.ravel(), d_hidden.reshape(-1, n_embd))
+    return logits
+
+for step in range(max_steps):
+    lr = min_lr + 0.5 * (max_lr - min_lr) * (1 + np.cos(np.pi * (step - warmup_steps) / (max_steps - warmup_steps))) if step >= warmup_steps else max_lr * (step + 1) / warmup_steps
+    if step > max_steps: lr = min_lr
+    for weight_dict in [global_weights, *blocks]:
+        for weight in weight_dict.values(): 
+            if 'val' in weight: weight['grad'] = np.zeros_like(weight['val'])
+    for _ in range(accum_steps):
+        if batches_left <= 0:
+            while len(buffer) < 100000:
+                try:
+                    if t := next(ds_iter)["text"].strip(): buffer.extend(enc.encode(t))
+                except StopIteration: break
+            shard = np.array(buffer, dtype=np.uint16)
+            buffer = []
+            batches_left = len(shard) // (bs * seq_len)
+        indices = np.random.randint(0, len(shard) - seq_len - 1, (bs,))
+        batch = np.array(np.stack([shard[i:i+seq_len+1] for i in indices]))
+        batches_left -= 1
+        inputs, targets = batch[:, :-1], batch[:, 1:]
+        forward(inputs, targets=targets)        
+    all_weights = [('tok_emb', global_weights['tok_emb']), ('pos_emb', global_weights['pos_emb']), ('ln_f_g', global_weights['ln_f_g']), ('ln_f_b', global_weights['ln_f_b'])] + [x for b in blocks for x in b.items()]
+    grad_norm = np.sqrt(sum(np.sum(np.square(weight['grad'])) for n, weight in all_weights if 'grad' in weight))
+    clip = 1.0 if grad_norm <= 1.0 else 1.0 / (grad_norm + 1e-6)
+    for name, weight in all_weights:
+        if 'grad' not in weight: continue
+        if 'm' not in weight: weight['m'], weight['v'] = np.zeros_like(weight['val']), np.zeros_like(weight['val'])
+        weight['m'] = 0.9 * weight['m'] + 0.1 * (weight['grad'] * clip)
+        weight['v'] = 0.999 * weight['v'] + 0.001 * ((weight['grad'] * clip) ** 2)
+        if name.endswith('_w') or 'emb' in name: weight['val'] *= (1.0 - lr * 0.1)
+        weight['val'] -= lr * (weight['m'] / (1 - 0.9**(step + 1))) / (np.sqrt(weight['v'] / (1 - 0.999**(step + 1))) + 1e-8)
+    
+    if step % 100 == 0:
+        val_losses = []
+        for _ in range(20):
+            batch = np.array([val_data[i:i+seq_len+1] for i in np.random.randint(0, len(val_data) - seq_len - 1, (bs,))])
+            inputs, targets = batch[:, :-1], batch[:, 1:]
+            logits = forward(inputs).reshape(-1, vocab_size)
+            probs = np.exp(logits - logits.max(1, keepdims=1))
+            probs /= probs.sum(1, keepdims=1)
+            val_losses.append(-np.log(probs[np.arange(targets.size), targets.ravel()]).mean().item())
+        print(f"step {step} | lr {lr} | val_loss {sum(val_losses)/20}")
