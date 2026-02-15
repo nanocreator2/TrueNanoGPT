@@ -1,5 +1,4 @@
-import tiktoken
-import numpy as np
+import tiktoken, numpy as np
 from datasets import load_dataset
 
 seed, target_batch, bs, seq_len = 1337, 16, 8, 16
